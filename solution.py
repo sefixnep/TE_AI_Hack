@@ -1,4 +1,5 @@
-pdf_path = input("ВВедите путь к PDF файлу: ")
+pdf_path = input("Введите путь к PDF файлу: ")
+high_quality = True
 ## ENVIRONMENT
 import os
 from dotenv import load_dotenv
@@ -6,23 +7,32 @@ from dotenv import load_dotenv
 load_dotenv()
 api = os.getenv("api")
 ## PDF Preprocessing
-import uuid
+import hashlib
 import pdfplumber
+import os
+
+def get_file_hash(filepath):
+    """Вычисляет SHA256-хэш файла и возвращает первые 16 символов."""
+    hash_sha256 = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_sha256.update(chunk)
+    return hash_sha256.hexdigest()[:16]
 
 def pdf_to_images(pdf_path, resolution=300):
     """
     Конвертирует все страницы PDF в изображения.
-    
+
     Аргументы:
         pdf_path (str): путь к PDF файлу
         resolution (int): DPI для рендера страниц
-    
+
     Возвращает:
         (pdf_id, image_paths) где
-        pdf_id (str): уникальный id для папки
+        pdf_id (str): уникальный id для папки (хэш файла)
         image_paths (list[str]): список путей к сохранённым изображениям
     """
-    pdf_id = str(uuid.uuid4())
+    pdf_id = get_file_hash(pdf_path)
     output_dir = f"images/{pdf_id}"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -37,15 +47,22 @@ def pdf_to_images(pdf_path, resolution=300):
 
     return pdf_id, image_paths
 
-
-
 # пример вызова
 pdf_id, image_paths = pdf_to_images(pdf_path)
 print(pdf_id)
 ## Processing
 prompt = f"""
 You are a professional comic storyboard writer. 
-Your task is to transform a given sequence of **images** (possibly from parsed PDF documents with mixed pictures and captions) into a cinematic comic script. 
+Your task is to transform a given sequence of **images** (possibly from parsed PDFs with mixed pictures and captions) into a cinematic comic script.
+
+LANGUAGE & VISIBLE TEXT (VERY IMPORTANT):
+- All dialogue, narration, labels, signage, UI, stamps, documents, and SFX **must be in English only**.
+- Translate any non-English text from the source images into natural English. Do NOT use transliteration or Cyrillic.
+- Use only ASCII letters A–Z, digits, and standard punctuation for any quoted visible text.
+- Avoid mixed languages, non-English diacritics, and random character noise.
+- When visible text should appear in a panel, write it explicitly inside the description, e.g.:
+  Text on sign: "CITY HALL". Stamp: "APPROVED". SFX: "CLACK".
+- For proper nouns originally non-English, choose a consistent English form (e.g., "Moscow City Court") and use it throughout.
 
 Instructions:
 1. Carefully **describe each image** in English (visual content, characters, actions, mood, setting).
@@ -63,12 +80,13 @@ Instructions:
 
 Rules:
 - Do not include any extra variables or explanations (no `unified_style_en = ...`, no `slides = ...`). Only return the tuple above.
-- Replace any literal image captions (e.g., “a photography of a judge’s gavel”) with **visual narrative and cinematic descriptions**.
+- Replace any literal foreign/legal text with **visual narrative and natural English dialogue** between characters.
 - Ensure dialogue is simple, conversational, and in English.
 - Maintain continuity: the same characters should appear across panels and scenes, with consistent roles and personalities.
 - Each scene = exactly one 4-panel comic page.
 - Maximum 3 comic scenes per run (12 panels total).
 - Output must be valid Python (tuple of a string + list of strings), parsable with `ast.literal_eval`.
+- Final self-check: ensure there are **no non-English characters** anywhere in the tuple; if any appear, replace with correct English.
 
 ---
 SOURCE IMAGES:
@@ -142,12 +160,13 @@ def extract_comic_tuple(text: str):
 while True:
     try:
         completion = client.chat.completions.create(
-            model="openai/gpt-5-nano",
+            model=("openai/gpt-5-nano" if not high_quality else "openai/gpt-5"),
             messages=[message],
         )
         llm_output = completion.choices[0].message.content
         unified_style, slides = extract_comic_tuple(llm_output)
     except Exception as e:
+        print(e)
         continue
     else:
         break
@@ -165,7 +184,17 @@ import logging
 import requests
 from pathlib import Path
 from openai import OpenAI
+import os
 
+def fix_base64_padding(b64_string):
+    """Добавляет недостающие символы '=' для корректной декодировки base64."""
+    b64_string = b64_string.strip()
+    # Удаляем все пробелы и переносы строк
+    b64_string = b64_string.replace('\n', '').replace('\r', '').replace(' ', '')
+    missing_padding = len(b64_string) % 4
+    if missing_padding:
+        b64_string += '=' * (4 - missing_padding)
+    return b64_string
 
 class OpenRouterImageAPI:
     def __init__(self, api_key, model=None, size=None):
@@ -181,17 +210,17 @@ class OpenRouterImageAPI:
             default_headers=default_headers or None,
         )
 
-        # Keep for manual HTTP fallback
+        # Для ручного HTTP fallback
         self.api_key = api_key
         self.default_headers = default_headers or None
 
-        # Используй модель, которая поддерживает image output
+        # Используем модель, поддерживающую вывод изображений
         self.model = model or os.getenv("OPENROUTER_IMAGE_MODEL", "google/gemini-2.5-flash-image-preview")
         self.size = size or os.getenv("OPENROUTER_IMAGE_SIZE", "1024x1024")
 
     def generate_image(self, prompt, num_images=1, output_dir="outputs", prefix="slide"):
         Path(output_dir).mkdir(parents=True, exist_ok=True)
-        logging.info(f"Generating image via OpenRouter model='{self.model}' size='{self.size}'")
+        logging.info(f"Генерируем изображение через OpenRouter model='{self.model}' size='{self.size}'")
 
         resp = self.client.chat.completions.create(
             model=self.model,
@@ -211,10 +240,10 @@ class OpenRouterImageAPI:
         for i, choice in enumerate(resp.choices, start=1):
             content = getattr(choice.message, "content", None)
             if not content:
-                logging.error(f"No content in choice: {choice}")
+                logging.error(f"Нет контента в choice: {choice}")
                 continue
 
-            # Normalize to iterable of blocks
+            # Приводим к списку блоков
             blocks = content if isinstance(content, list) else [content]
 
             for block in blocks:
@@ -223,13 +252,13 @@ class OpenRouterImageAPI:
 
                 if isinstance(block, dict):
                     btype = block.get("type") or block.get("kind")
-                    # OpenRouter 'output_image' (most common)
+                    # OpenRouter 'output_image' (наиболее часто)
                     if btype in ("output_image", "image"):
                         b64 = block.get("image_base64") or block.get("b64_json")
-                        # Some providers nest it
+                        # Некоторые провайдеры вкладывают глубже
                         if not b64 and isinstance(block.get("image"), dict):
                             b64 = block["image"].get("b64_json") or block["image"].get("base64")
-                    # Our previous handler for data URLs
+                    # Старый обработчик data URLs
                     if btype == "image_url" and isinstance(block.get("image_url"), dict):
                         img_url = block["image_url"].get("url", "")
                         if isinstance(img_url, str) and img_url.startswith("data:"):
@@ -247,24 +276,25 @@ class OpenRouterImageAPI:
                         except Exception:
                             b64 = None
                     else:
-                        # Heuristic: treat long strings as raw base64
+                        # Эвристика: длинные строки считаем base64
                         if len(text) > 100:
                             b64 = text
 
-                # Save from base64 if available
+                # Сохраняем из base64, если есть
                 if b64:
                     try:
-                        image_bytes = base64.b64decode(b64)
+                        b64_fixed = fix_base64_padding(b64)
+                        image_bytes = base64.b64decode(b64_fixed)
                         image_counter += 1
                         file_path = Path(output_dir) / f"{prefix}-{timestamp}-{image_counter}.png"
                         with open(file_path, "wb") as f:
                             f.write(image_bytes)
                         saved_paths.append(str(file_path))
                     except Exception as e:
-                        logging.error(f"Failed to decode/save base64 image: {e}")
+                        logging.error(f"Ошибка при декодировании/сохранении base64 изображения: {e}")
                         continue
 
-                # Fallback: fetch via URL if provided
+                # Фоллбек: скачиваем по URL, если есть
                 if url_to_fetch:
                     try:
                         r = requests.get(url_to_fetch, timeout=60)
@@ -275,19 +305,19 @@ class OpenRouterImageAPI:
                             f.write(r.content)
                         saved_paths.append(str(file_path))
                     except Exception as e:
-                        logging.error(f"Failed to download image from URL: {e}")
+                        logging.error(f"Ошибка при скачивании изображения по URL: {e}")
                         continue
 
         if not saved_paths:
-            # Deep fallback: scan the entire response object for base64 image strings
+            # Глубокий фоллбек: сканируем весь объект ответа на base64 строки
             try:
                 def walk_collect_b64(value, out_list):
                     if isinstance(value, dict):
                         for k, v in value.items():
-                            # Common keys used by providers
+                            # Часто используемые ключи
                             if k in ("image_base64", "b64_json", "imageBytes", "image_base64_png") and isinstance(v, str):
                                 out_list.append(v)
-                            # Any URL fields containing data URLs
+                            # Любые поля URL с data URL
                             if k in ("url", "image_url") and isinstance(v, str) and v.startswith("data:"):
                                 try:
                                     _, b = v.split(",", 1)
@@ -308,7 +338,7 @@ class OpenRouterImageAPI:
                             except Exception:
                                 pass
                         else:
-                            # Heuristic: very long base64-ish strings
+                            # Эвристика: очень длинные base64-подобные строки
                             if len(text) > 500 and all(c.isalnum() or c in "+/=\n\r" for c in text[:100]):
                                 out_list.append(text)
 
@@ -331,7 +361,8 @@ class OpenRouterImageAPI:
 
                 for idx, b64 in enumerate(candidates, start=1):
                     try:
-                        image_bytes = base64.b64decode(b64)
+                        b64_fixed = fix_base64_padding(b64)
+                        image_bytes = base64.b64decode(b64_fixed)
                         file_path = Path(output_dir) / f"{prefix}-{timestamp}-fallback-{idx}.png"
                         with open(file_path, "wb") as f:
                             f.write(image_bytes)
@@ -339,9 +370,9 @@ class OpenRouterImageAPI:
                     except Exception:
                         continue
             except Exception as e:
-                logging.debug(f"Fallback scan error: {e}")
+                logging.debug(f"Ошибка при сканировании фоллбека: {e}")
 
-        # Final fallback: call OpenRouter directly via HTTP to avoid SDK type quirks
+        # Финальный фоллбек: прямой HTTP-запрос к OpenRouter
         if not saved_paths:
             try:
                 headers = {
@@ -353,7 +384,6 @@ class OpenRouterImageAPI:
                 body = {
                     "model": self.model,
                     "messages": [{"role": "user", "content": prompt}],
-                    # Provider-specific hints are forwarded by OpenRouter
                     "modalities": ["image", "text"],
                     "n": num_images,
                     "size": self.size,
@@ -368,7 +398,7 @@ class OpenRouterImageAPI:
                 http_resp.raise_for_status()
                 data = http_resp.json()
 
-                # Reuse collector
+                # Повторно используем сборщик
                 candidates = []
                 def walk_collect_b64_http(value, out_list):
                     if isinstance(value, dict):
@@ -401,7 +431,8 @@ class OpenRouterImageAPI:
 
                 for idx, b64 in enumerate(candidates, start=1):
                     try:
-                        image_bytes = base64.b64decode(b64)
+                        b64_fixed = fix_base64_padding(b64)
+                        image_bytes = base64.b64decode(b64_fixed)
                         file_path = Path(output_dir) / f"{prefix}-{timestamp}-http-{idx}.png"
                         with open(file_path, "wb") as f:
                             f.write(image_bytes)
@@ -409,32 +440,34 @@ class OpenRouterImageAPI:
                     except Exception:
                         continue
             except Exception as e:
-                logging.error(f"HTTP fallback failed: {e}")
+                logging.error(f"HTTP fallback не удался: {e}")
 
         if not saved_paths:
-            # Regex scan of any text representation for embedded base64
+            # Регулярное выражение для поиска base64 в любом текстовом представлении
             try:
                 import re
                 def extract_and_save_from_text(text: str, tag: str):
                     local_saved = []
                     if not text:
                         return local_saved
-                    # data URL pattern first
+                    # data URL pattern
                     for m in re.finditer(r"data:image/[^;]+;base64,([A-Za-z0-9+/=\r\n]+)", text):
                         b64 = m.group(1)
                         try:
-                            image_bytes = base64.b64decode(b64)
+                            b64_fixed = fix_base64_padding(b64)
+                            image_bytes = base64.b64decode(b64_fixed)
                             file_path = Path(output_dir) / f"{prefix}-{timestamp}-scan-{tag}-{len(local_saved)+1}.png"
                             with open(file_path, "wb") as f:
                                 f.write(image_bytes)
                             local_saved.append(str(file_path))
                         except Exception:
                             continue
-                    # Generic long base64 chunks (PNG/JPEG often start with iVBOR or /9j/)
+                    # Generic long base64 chunks (PNG/JPEG часто начинаются с iVBOR или /9j/)
                     for m in re.finditer(r"(iVBOR|/9j/)[A-Za-z0-9+/=\r\n]{400,}", text):
                         b64 = m.group(0)
                         try:
-                            image_bytes = base64.b64decode(b64)
+                            b64_fixed = fix_base64_padding(b64)
+                            image_bytes = base64.b64decode(b64_fixed)
                             file_path = Path(output_dir) / f"{prefix}-{timestamp}-scan-{tag}-{len(local_saved)+1}.png"
                             with open(file_path, "wb") as f:
                                 f.write(image_bytes)
@@ -445,7 +478,7 @@ class OpenRouterImageAPI:
 
                 text_repr = None
                 try:
-                    text_repr = resp.model_dump_json()  # may omit large blobs
+                    text_repr = resp.model_dump_json()  # может не содержать большие блобы
                 except Exception:
                     text_repr = str(resp)
                 saved_paths.extend(extract_and_save_from_text(text_repr, "obj"))
@@ -453,7 +486,7 @@ class OpenRouterImageAPI:
                 pass
 
         if not saved_paths:
-            raise Exception("Image generation returned no images")
+            raise Exception("Генерация изображения не вернула ни одного изображения")
 
         return saved_paths
 
